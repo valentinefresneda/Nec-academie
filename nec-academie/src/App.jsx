@@ -1,6 +1,60 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { doc, onSnapshot, setDoc } from "firebase/firestore";
-import { db } from "./firebase";
+import { doc, onSnapshot, setDoc, getDoc, collection, query, where, getDocs, deleteDoc } from "firebase/firestore";
+import {
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut,
+  sendPasswordResetEmail,
+  createUserWithEmailAndPassword,
+  updatePassword,
+} from "firebase/auth";
+import { db, auth, secondaryAuth } from "./firebase";
+
+/* ---------------- Authentification & rôles ----------------
+   Chaque compte (Firebase Authentication) a un document
+   users/{uid} qui indique son rôle :
+     { role: "famille", childIds: ["prenom-nom", ...] }
+     { role: "Éducateur" | "Administrateur" | "Administrateur général", staffId: "staff-xxx" }
+   Seul un administrateur général peut créer des comptes (voir
+   GestionAcces et AjouterEnfant), via une session Firebase Auth
+   secondaire pour ne pas déconnecter son propre compte.
+------------------------------------------------------------- */
+function useAuthProfile() {
+  const [authUser, setAuthUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [profile, setProfile] = useState(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setAuthUser(u);
+      setAuthLoading(false);
+      setProfile(null);
+    });
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    if (!authUser) return;
+    setProfileLoading(true);
+    const unsub = onSnapshot(
+      doc(db, "users", authUser.uid),
+      (snap) => { setProfile(snap.exists() ? snap.data() : null); setProfileLoading(false); },
+      () => { setProfile(null); setProfileLoading(false); }
+    );
+    return () => unsub();
+  }, [authUser]);
+
+  return { authUser, authLoading, profile, profileLoading };
+}
+
+/* Crée un compte (famille ou staff) sans déconnecter l'administrateur
+   actuellement connecté, grâce à l'app Firebase secondaire. */
+async function createManagedAccount(email, password) {
+  const cred = await createUserWithEmailAndPassword(secondaryAuth, email, password);
+  await signOut(secondaryAuth);
+  return cred.user.uid;
+}
 
 /* ============================================================
    NEC ACADÉMIE — L'Aventure des Dragons — Prototype v3
@@ -346,7 +400,42 @@ function LoginField({ icon, placeholder, type = "text" }) {
   );
 }
 
-function Login({ onFamille, onEducateur, logoLight, logoDark, bgColor }) {
+function Login({ logoLight, logoDark, bgColor }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [err, setErr] = useState("");
+  const [info, setInfo] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const messageFor = (code) => ({
+    "auth/invalid-email": "Adresse e-mail invalide.",
+    "auth/user-not-found": "Aucun compte ne correspond à cet e-mail.",
+    "auth/wrong-password": "Mot de passe incorrect.",
+    "auth/invalid-credential": "E-mail ou mot de passe incorrect.",
+    "auth/too-many-requests": "Trop de tentatives, réessayez dans quelques minutes.",
+  }[code] || "Connexion impossible. Vérifiez vos identifiants.");
+
+  const valider = async () => {
+    if (!email.trim() || !password) return;
+    setErr(""); setInfo(""); setBusy(true);
+    try {
+      await signInWithEmailAndPassword(auth, email.trim(), password);
+    } catch (e) {
+      setErr(messageFor(e.code));
+    } finally { setBusy(false); }
+  };
+
+  const motDePasseOublie = async () => {
+    if (!email.trim()) { setErr("Indiquez d'abord votre e-mail ci-dessus."); return; }
+    setErr(""); setInfo(""); setBusy(true);
+    try {
+      await sendPasswordResetEmail(auth, email.trim());
+      setInfo("E-mail de réinitialisation envoyé, si ce compte existe.");
+    } catch (e) {
+      setErr(messageFor(e.code));
+    } finally { setBusy(false); }
+  };
+
   return (
     <div style={{ minHeight: "100vh", background: bgColor || BRAND.white, display: "flex", flexDirection: "column", alignItems: "center", padding: "40px 20px" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", maxWidth: 900, marginBottom: 40, flexWrap: "wrap", gap: 20 }}>
@@ -360,25 +449,25 @@ function Login({ onFamille, onEducateur, logoLight, logoDark, bgColor }) {
 
       <div style={{ fontFamily: "'Baloo 2', sans-serif", fontSize: 20, color: "#333", marginBottom: 30 }}>Connexion</div>
 
-      <div style={{ display: "flex", gap: 60, flexWrap: "wrap", justifyContent: "center", width: "100%", maxWidth: 760 }}>
-        <div style={{ flex: 1, minWidth: 260, textAlign: "center" }}>
-          <div style={{ fontFamily: "'Baloo 2', sans-serif", fontSize: 17, color: "#333", marginBottom: 18 }}>Utilisateur</div>
-          <LoginField icon="✉️" placeholder="Adresse e-mail" />
-          <LoginField icon="🔑" placeholder="Mot de passe" type="password" />
-          <button onClick={onFamille} style={{ marginTop: 8, padding: "10px 34px", borderRadius: 10, border: `2px solid ${BRAND.red}`, background: BRAND.white, color: BRAND.black, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Valider</button>
-          <div style={{ color: "#999", fontSize: 11, marginTop: 8 }}>Enfants &amp; parents</div>
+      <div style={{ width: "100%", maxWidth: 320, textAlign: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, borderBottom: `1.5px solid ${BRAND.black}`, padding: "6px 2px", marginBottom: 18 }}>
+          <span style={{ color: BRAND.red, fontSize: 15 }}>✉️</span>
+          <input value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => e.key === "Enter" && valider()} type="email" placeholder="Adresse e-mail" style={{ border: "none", outline: "none", flex: 1, fontSize: 13, color: BRAND.black, background: "transparent" }} />
         </div>
-        <div style={{ width: 1, background: "#ddd" }} />
-        <div style={{ flex: 1, minWidth: 260, textAlign: "center" }}>
-          <div style={{ fontFamily: "'Baloo 2', sans-serif", fontSize: 17, color: "#333", marginBottom: 18 }}>Administrateur</div>
-          <LoginField icon="✉️" placeholder="Adresse e-mail" />
-          <LoginField icon="🔑" placeholder="Mot de passe" type="password" />
-          <button onClick={onEducateur} style={{ marginTop: 8, padding: "10px 34px", borderRadius: 10, border: `2px solid ${BRAND.red}`, background: BRAND.white, color: BRAND.black, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Valider</button>
-          <div style={{ color: "#999", fontSize: 11, marginTop: 8 }}>Éducateurs &amp; administrateurs</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, borderBottom: `1.5px solid ${BRAND.black}`, padding: "6px 2px", marginBottom: 18 }}>
+          <span style={{ color: BRAND.red, fontSize: 15 }}>🔑</span>
+          <input value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && valider()} type="password" placeholder="Mot de passe" style={{ border: "none", outline: "none", flex: 1, fontSize: 13, color: BRAND.black, background: "transparent" }} />
         </div>
+        {err && <div style={{ color: BRAND.red, fontSize: 12, marginBottom: 10 }}>{err}</div>}
+        {info && <div style={{ color: "#2a7", fontSize: 12, marginBottom: 10 }}>{info}</div>}
+        <button onClick={valider} disabled={busy || !email.trim() || !password} style={{ padding: "10px 34px", borderRadius: 10, border: `2px solid ${BRAND.red}`, background: BRAND.white, color: BRAND.black, fontWeight: 700, fontSize: 14, cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}>{busy ? "…" : "Valider"}</button>
+        <div style={{ marginTop: 14 }}>
+          <button onClick={motDePasseOublie} disabled={busy} style={{ background: "none", border: "none", color: "#888", fontSize: 11.5, textDecoration: "underline", cursor: "pointer" }}>Mot de passe oublié ?</button>
+        </div>
+        <div style={{ color: "#999", fontSize: 11, marginTop: 14 }}>Comptes créés par l'administrateur du club (famille, éducateur, administrateur)</div>
       </div>
 
-      <div style={{ marginTop: 48, color: "#bbb", fontSize: 11 }}>Nautique Entente Châlonnaise — prototype de démonstration</div>
+      <div style={{ marginTop: 48, color: "#bbb", fontSize: 11 }}>Nautique Entente Châlonnaise</div>
     </div>
   );
 }
@@ -1108,19 +1197,35 @@ function ChildProfileAdmin({ child, group, maison, onToggleBadge, onBack }) {
 function AjouterEnfant({ data, persist, onDone }) {
   const [prenom, setPrenom] = useState(""); const [nom, setNom] = useState(""); const [age, setAge] = useState(8);
   const [groupId, setGroupId] = useState(data.groups[0]?.id || "");
+  const [parentEmail, setParentEmail] = useState(""); const [parentPassword, setParentPassword] = useState("");
+  const [err, setErr] = useState(""); const [busy, setBusy] = useState(false);
   const group = data.groups.find((g) => g.id === groupId);
 
-  const creer = () => {
-    if (!prenom.trim() || !nom.trim() || !group) return;
-    const next = JSON.parse(JSON.stringify(data));
-    next.children.push({
-      id: `${prenom}-${nom}-${Date.now()}`.toLowerCase(),
-      prenom: prenom.trim(), nom: nom.trim(), age: Number(age), groupId: group.id, maisonId: group.maisonId,
-      tridents: 0, badgesObtained: [], historique: [],
-      settings: { notifications: true, email: `${prenom.toLowerCase()}.${nom.toLowerCase()}@famille-nec.fr` },
-    });
-    persist(next);
-    onDone();
+  const messageFor = (code) => ({
+    "auth/email-already-in-use": "Un compte existe déjà avec cet e-mail. Pour un 2ᵉ enfant sur le même compte, ajoutez son identifiant à la liste childIds de ce compte directement dans Firestore (console.firebase.google.com), ou utilisez un autre e-mail pour l'instant.",
+    "auth/invalid-email": "Adresse e-mail du parent invalide.",
+    "auth/weak-password": "Le mot de passe doit contenir au moins 6 caractères.",
+  }[code] || "Impossible de créer le compte du parent.");
+
+  const creer = async () => {
+    if (!prenom.trim() || !nom.trim() || !group || !parentEmail.trim() || parentPassword.length < 6) return;
+    setErr(""); setBusy(true);
+    const childId = `${prenom}-${nom}-${Date.now()}`.toLowerCase();
+    try {
+      const uid = await createManagedAccount(parentEmail.trim(), parentPassword);
+      await setDoc(doc(db, "users", uid), { role: "famille", childIds: [childId] });
+      const next = JSON.parse(JSON.stringify(data));
+      next.children.push({
+        id: childId,
+        prenom: prenom.trim(), nom: nom.trim(), age: Number(age), groupId: group.id, maisonId: group.maisonId,
+        tridents: 0, badgesObtained: [], historique: [],
+        settings: { notifications: true, email: parentEmail.trim() },
+      });
+      await persist(next);
+      onDone();
+    } catch (e) {
+      setErr(messageFor(e.code));
+    } finally { setBusy(false); }
   };
 
   return (
@@ -1133,9 +1238,13 @@ function AjouterEnfant({ data, persist, onDone }) {
         <select value={groupId} onChange={(e) => setGroupId(e.target.value)} style={{ padding: "9px 12px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 13, outline: "none" }}>
           {data.groups.map((g) => <option key={g.id} value={g.id}>{g.name} — {MAISON_META[g.maisonId].name}</option>)}
         </select>
+        <div style={{ borderTop: `1px solid ${COLORS.border}`, marginTop: 4, paddingTop: 8, color: COLORS.textDim, fontSize: 11.5 }}>Compte de connexion du parent</div>
+        <input value={parentEmail} onChange={(e) => setParentEmail(e.target.value)} type="email" placeholder="E-mail du parent" style={{ padding: "9px 12px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 13, outline: "none" }} />
+        <input value={parentPassword} onChange={(e) => setParentPassword(e.target.value)} type="text" placeholder="Mot de passe provisoire (6 caractères min.)" style={{ padding: "9px 12px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 13, outline: "none" }} />
       </div>
+      {err && <div style={{ color: BRAND.red, fontSize: 12, marginTop: 8 }}>{err}</div>}
       <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-        <Btn onClick={creer} disabled={!prenom.trim() || !nom.trim()}>Créer l'enfant</Btn>
+        <Btn onClick={creer} disabled={busy || !prenom.trim() || !nom.trim() || !parentEmail.trim() || parentPassword.length < 6}>{busy ? "Création…" : "Créer l'enfant"}</Btn>
         <Btn variant="ghost" onClick={onDone}>Annuler</Btn>
       </div>
     </Card>
@@ -1516,18 +1625,51 @@ function Personnalisation({ data, persist }) {
 }
 
 function GestionAcces({ data, persist }) {
-  const [prenom, setPrenom] = useState(""); const [nom, setNom] = useState(""); const [email, setEmail] = useState(""); const [role, setRole] = useState("Éducateur");
+  const [prenom, setPrenom] = useState(""); const [nom, setNom] = useState(""); const [email, setEmail] = useState("");
+  const [password, setPassword] = useState(""); const [role, setRole] = useState("Éducateur");
+  const [err, setErr] = useState(""); const [busy, setBusy] = useState(false);
   const roles = ["Éducateur", "Administrateur", "Administrateur général"];
 
-  const ajouter = () => {
-    if (!prenom.trim() || !nom.trim()) return;
-    const next = JSON.parse(JSON.stringify(data));
-    next.staff.push({ id: `staff-${Date.now()}`, prenom: prenom.trim(), nom: nom.trim(), email: email.trim(), role });
-    persist(next);
-    setPrenom(""); setNom(""); setEmail("");
+  const messageFor = (code) => ({
+    "auth/email-already-in-use": "Un compte existe déjà avec cet e-mail.",
+    "auth/invalid-email": "Adresse e-mail invalide.",
+    "auth/weak-password": "Le mot de passe doit contenir au moins 6 caractères.",
+  }[code] || "Impossible de créer ce compte.");
+
+  const ajouter = async () => {
+    if (!prenom.trim() || !nom.trim() || !email.trim() || password.length < 6) return;
+    setErr(""); setBusy(true);
+    const staffId = `staff-${Date.now()}`;
+    try {
+      const uid = await createManagedAccount(email.trim(), password);
+      await setDoc(doc(db, "users", uid), { role, staffId });
+      const next = JSON.parse(JSON.stringify(data));
+      next.staff.push({ id: staffId, prenom: prenom.trim(), nom: nom.trim(), email: email.trim(), role });
+      await persist(next);
+      setPrenom(""); setNom(""); setEmail(""); setPassword("");
+    } catch (e) {
+      setErr(messageFor(e.code));
+    } finally { setBusy(false); }
   };
-  const setRoleFor = (id, newRole) => { const next = JSON.parse(JSON.stringify(data)); next.staff.find((s) => s.id === id).role = newRole; persist(next); };
-  const supprimer = (id) => { const next = { ...data, staff: data.staff.filter((s) => s.id !== id) }; persist(next); };
+  const setRoleFor = async (id, newRole) => {
+    const next = JSON.parse(JSON.stringify(data));
+    next.staff.find((s) => s.id === id).role = newRole;
+    await persist(next);
+    // Met aussi à jour le vrai compte (users/{uid}), pas seulement l'affichage.
+    const q = query(collection(db, "users"), where("staffId", "==", id));
+    const snap = await getDocs(q);
+    snap.forEach((d) => setDoc(d.ref, { ...d.data(), role: newRole }));
+  };
+  const supprimer = async (id) => {
+    const next = { ...data, staff: data.staff.filter((s) => s.id !== id) };
+    await persist(next);
+    // Supprime aussi l'accès du compte lié (la personne ne pourra plus se
+    // connecter — son compte Authentication reste techniquement présent
+    // mais n'a plus de rôle, donc plus aucun accès à l'application).
+    const q = query(collection(db, "users"), where("staffId", "==", id));
+    const snap = await getDocs(q);
+    snap.forEach((d) => deleteDoc(d.ref));
+  };
 
   return (
     <Card>
@@ -1552,47 +1694,68 @@ function GestionAcces({ data, persist }) {
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <input value={prenom} onChange={(e) => setPrenom(e.target.value)} placeholder="Prénom" style={{ flex: 1, minWidth: 100, padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 12.5, outline: "none" }} />
           <input value={nom} onChange={(e) => setNom(e.target.value)} placeholder="Nom" style={{ flex: 1, minWidth: 100, padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 12.5, outline: "none" }} />
-          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="E-mail" style={{ flex: 1, minWidth: 140, padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 12.5, outline: "none" }} />
+          <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" placeholder="E-mail" style={{ flex: 1, minWidth: 140, padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 12.5, outline: "none" }} />
+          <input value={password} onChange={(e) => setPassword(e.target.value)} type="text" placeholder="Mot de passe provisoire" style={{ flex: 1, minWidth: 140, padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 12.5, outline: "none" }} />
           <select value={role} onChange={(e) => setRole(e.target.value)} style={{ padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 12.5 }}>
             {roles.map((r) => <option key={r} value={r}>{r}</option>)}
           </select>
         </div>
-        <Btn onClick={ajouter} disabled={!prenom.trim() || !nom.trim()} style={{ width: "fit-content" }}>Ajouter</Btn>
+        {err && <div style={{ color: BRAND.red, fontSize: 12 }}>{err}</div>}
+        <Btn onClick={ajouter} disabled={busy || !prenom.trim() || !nom.trim() || !email.trim() || password.length < 6} style={{ width: "fit-content" }}>{busy ? "Création…" : "Ajouter"}</Btn>
       </div>
     </Card>
   );
 }
 
-function ParametresEduc({ data, persist }) {
+function ParametresEduc({ data, persist, me, isAdminGeneral }) {
+  const [newPassword, setNewPassword] = useState("");
+  const [msg, setMsg] = useState("");
+  const changerMotDePasse = async () => {
+    if (newPassword.length < 6) { setMsg("6 caractères minimum."); return; }
+    try {
+      await updatePassword(auth.currentUser, newPassword);
+      setMsg("Mot de passe mis à jour.");
+      setNewPassword("");
+    } catch (e) {
+      setMsg("Impossible (reconnectez-vous puis réessayez).");
+    }
+  };
   return (
     <div style={{ display: "grid", gap: 16, maxWidth: 520 }}>
       <Card>
         <div style={{ color: COLORS.text, fontWeight: 700, marginBottom: 12, fontFamily: "'Baloo 2', sans-serif" }}>Informations personnelles</div>
         <div style={{ display: "grid", gap: 10 }}>
-          {[["Prénom", "Hugo"], ["Nom", "Lambert"], ["E-mail", "hugo.lambert@nec-natation.fr"], ["Mot de passe", "••••••••"]].map(([label, val]) => (
+          {[["Prénom", me?.prenom || "—"], ["Nom", me?.nom || "—"], ["E-mail", me?.email || auth.currentUser?.email || "—"], ["Rôle", me?.role || "—"]].map(([label, val]) => (
             <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><span style={{ color: COLORS.textDim, fontSize: 12.5 }}>{label}</span><span style={{ color: COLORS.text, fontSize: 13 }}>{val}</span></div>
           ))}
         </div>
-        <Btn variant="ghost" style={{ marginTop: 12, width: "100%" }}>Modifier mes informations</Btn>
+        <div style={{ borderTop: `1px solid ${COLORS.border}`, marginTop: 12, paddingTop: 12, display: "flex", gap: 8 }}>
+          <input value={newPassword} onChange={(e) => setNewPassword(e.target.value)} type="text" placeholder="Nouveau mot de passe" style={{ flex: 1, padding: "9px 12px", borderRadius: 8, border: `1px solid ${COLORS.border}`, background: COLORS.panelLight, color: COLORS.text, fontSize: 13, outline: "none" }} />
+          <Btn variant="ghost" onClick={changerMotDePasse}>Changer</Btn>
+        </div>
+        {msg && <div style={{ color: COLORS.textDim, fontSize: 11.5, marginTop: 6 }}>{msg}</div>}
       </Card>
-      <GestionAcces data={data} persist={persist} />
+      {isAdminGeneral && <GestionAcces data={data} persist={persist} />}
     </div>
   );
 }
 
-function EducateurApp({ data, persist, onLogout }) {
+function EducateurApp({ data, persist, role, me, onLogout }) {
   const [tab, setTab] = useState("accueil");
   const [openGroup, setOpenGroup] = useState(null);
   const [editingRecord, setEditingRecord] = useState(null);
   const [statsGroup, setStatsGroup] = useState(null);
   const evt = activeEvent(data.events);
+  const isAdminGeneral = role === "Administrateur général";
 
   const tabs = [
     { id: "accueil", label: "Accueil", icon: "🏠" }, { id: "groupes", label: "Mes groupes", icon: "👥" },
     { id: "repertoire", label: "Répertoire", icon: "📇" }, { id: "classement", label: "Classement", icon: "🏆" },
     { id: "boutique", label: "Boutique", icon: "🛍️" }, { id: "evenements", label: "Événements", icon: "⚡" },
-    { id: "actualite", label: "Publier actu", icon: "📣" }, { id: "saison", label: "Saison", icon: "📅" },
-    { id: "personnalisation", label: "Personnalisation", icon: "🎨" },
+    ...(isAdminGeneral ? [
+      { id: "actualite", label: "Publier actu", icon: "📣" }, { id: "saison", label: "Saison", icon: "📅" },
+      { id: "personnalisation", label: "Personnalisation", icon: "🎨" },
+    ] : []),
     { id: "parametres", label: "Paramètres", icon: "⚙️" },
   ];
 
@@ -1610,7 +1773,7 @@ function EducateurApp({ data, persist, onLogout }) {
   const handleValidateRepertoire = (entries) => { persist(applyDeltas(data, entries, "événement")); };
 
   return (
-    <Shell title="Espace éducateur" subtitle={`Hugo · NEC Académie · Saison ${data.season.number}`} tabs={tabs}
+    <Shell title="Espace éducateur" subtitle={`${me ? `${me.prenom} · ${me.role}` : role} · NEC Académie · Saison ${data.season.number}`} tabs={tabs}
       active={tab} onTab={(t) => { setTab(t); if (t !== "groupes") resetSeanceView(); }} onLogout={onLogout} banner={<EventBanner event={evt} />}>
       {tab === "accueil" && <AccueilEduc data={data} onOpenGroup={handleOpenGroup} />}
       {tab === "groupes" && !openGroup && !statsGroup && <MesGroupes data={data} onOpenGroup={setOpenGroup} onEdit={handleEdit} onStats={handleStats} />}
@@ -1623,10 +1786,10 @@ function EducateurApp({ data, persist, onLogout }) {
       {tab === "classement" && <ClassementEduc data={data} />}
       {tab === "boutique" && <BoutiqueAdmin data={data} persist={persist} />}
       {tab === "evenements" && <Evenements data={data} persist={persist} />}
-      {tab === "actualite" && <PublierActu data={data} persist={persist} />}
-      {tab === "saison" && <Saison data={data} persist={persist} />}
-      {tab === "personnalisation" && <Personnalisation data={data} persist={persist} />}
-      {tab === "parametres" && <ParametresEduc data={data} persist={persist} />}
+      {isAdminGeneral && tab === "actualite" && <PublierActu data={data} persist={persist} />}
+      {isAdminGeneral && tab === "saison" && <Saison data={data} persist={persist} />}
+      {isAdminGeneral && tab === "personnalisation" && <Personnalisation data={data} persist={persist} />}
+      {tab === "parametres" && <ParametresEduc data={data} persist={persist} me={me} isAdminGeneral={isAdminGeneral} />}
     </Shell>
   );
 }
@@ -1636,7 +1799,7 @@ function EducateurApp({ data, persist, onLogout }) {
 ============================================================ */
 export default function NecAcademieApp() {
   const { data, loading, error, persist } = useAppData();
-  const [screen, setScreen] = useState("login");
+  const { authUser, authLoading, profile, profileLoading } = useAuthProfile();
   const [childId, setChildId] = useState(null);
 
   if (data) {
@@ -1671,17 +1834,71 @@ export default function NecAcademieApp() {
     );
   }
 
-  if (loading || !data) {
+  if (loading || !data || authLoading) {
     return <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: COLORS.bg, color: COLORS.textDim }}>{fontStyle}Chargement de NEC Académie…</div>;
   }
 
+  if (!authUser) {
+    return (
+      <div style={{ background: COLORS.bg }}>
+        {fontStyle}
+        <Login logoLight={data.logoImageLight} logoDark={data.logoImageDark} bgColor={data.theme?.loginBg} />
+      </div>
+    );
+  }
+
+  if (profileLoading) {
+    return <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: COLORS.bg, color: COLORS.textDim }}>{fontStyle}Chargement de votre compte…</div>;
+  }
+
+  if (!profile) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: COLORS.bg, color: COLORS.red, textAlign: "center", padding: 24 }}>
+        {fontStyle}
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Ce compte n'a pas encore d'accès configuré</div>
+          <div style={{ color: COLORS.textDim, fontSize: 13, marginBottom: 16 }}>Contactez l'administrateur du club pour qu'il vous associe un profil.</div>
+          <button onClick={() => signOut(auth)} style={{ padding: "9px 20px", borderRadius: 10, border: `1px solid ${COLORS.border}`, background: "transparent", color: COLORS.textDim, cursor: "pointer" }}>Se déconnecter</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (profile.role === "famille") {
+    const myChildren = data.children.filter((c) => (profile.childIds || []).includes(c.id));
+    if (myChildren.length === 0) {
+      return (
+        <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: COLORS.bg, color: COLORS.textDim, textAlign: "center", padding: 24 }}>
+          {fontStyle}
+          <div>
+            <div style={{ marginBottom: 16 }}>Aucun enfant n'est associé à ce compte pour le moment.</div>
+            <button onClick={() => signOut(auth)} style={{ padding: "9px 20px", borderRadius: 10, border: `1px solid ${COLORS.border}`, background: "transparent", color: COLORS.textDim, cursor: "pointer" }}>Se déconnecter</button>
+          </div>
+        </div>
+      );
+    }
+    if (myChildren.length > 1 && !childId) {
+      return (
+        <div style={{ background: COLORS.bg }}>
+          {fontStyle}
+          <ChildPicker children={myChildren} onPick={setChildId} onBack={() => signOut(auth)} />
+        </div>
+      );
+    }
+    const cid = childId || myChildren[0].id;
+    return (
+      <div style={{ background: COLORS.bg }}>
+        {fontStyle}
+        <FamilleApp data={data} persist={persist} childId={cid} onLogout={() => { signOut(auth); setChildId(null); }} />
+      </div>
+    );
+  }
+
+  const me = data.staff.find((s) => s.id === profile.staffId);
   return (
     <div style={{ background: COLORS.bg }}>
       {fontStyle}
-      {screen === "login" && <Login onFamille={() => setScreen("pick-child")} onEducateur={() => setScreen("educateur")} logoLight={data.logoImageLight} logoDark={data.logoImageDark} bgColor={data.theme?.loginBg} />}
-      {screen === "pick-child" && <ChildPicker children={data.children} onPick={(id) => { setChildId(id); setScreen("famille"); }} onBack={() => setScreen("login")} />}
-      {screen === "famille" && childId && <FamilleApp data={data} persist={persist} childId={childId} onLogout={() => { setScreen("login"); setChildId(null); }} />}
-      {screen === "educateur" && <EducateurApp data={data} persist={persist} onLogout={() => setScreen("login")} />}
+      <EducateurApp data={data} persist={persist} role={profile.role} me={me} onLogout={() => signOut(auth)} />
     </div>
   );
 }
